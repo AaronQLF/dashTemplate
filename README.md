@@ -120,10 +120,6 @@ python streamlit_example.py
 - plotly
 - numpy
 
-## Licence
-
-Ce projet est sous licence MIT.
-
 ## Contribution
 
 Les contributions sont les bienvenues ! N'hésitez pas à ouvrir une issue ou à soumettre une pull request. 
