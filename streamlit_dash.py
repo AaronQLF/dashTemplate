@@ -1,7 +1,9 @@
 import dash
-from dash import html, dcc, Input, Output
+from dash import html, dcc, Input, Output, State, ALL, MATCH, callback_context
 import dash_bootstrap_components as dbc
 import uuid
+import pandas as pd
+import json
 
 class OutilMiseEnPage:
     """
@@ -757,6 +759,212 @@ class OutilMiseEnPage:
         
         return table
     
+    def editable_matrix(self, data, drill_data=None, key=None, editable_columns=None):
+        """
+        Affiche une matrice éditable avec fonctionnalité de drill-through (expansion/réduction)
+        similaire à PowerBI
+        
+        Args:
+            data: Un DataFrame pandas pour les données principales
+            drill_data: Un dictionnaire où les clés sont les indices des lignes et les valeurs sont des DataFrames
+                        contenant les données détaillées pour chaque ligne
+            key (str, optional): Une clé unique pour la matrice
+            editable_columns (list, optional): Liste des noms de colonnes éditables
+        
+        Returns:
+            str: ID du tableau pour référence dans les callbacks
+        """
+        from dash import html, dcc, dash_table, Input, Output, State, ALL, MATCH, callback_context
+        
+        if key is None:
+            key = f"matrix-{str(uuid.uuid4())[:8]}"
+        
+        # Prépare les colonnes
+        columns = []
+        
+        # Ajoute une colonne pour le bouton d'expansion
+        columns.append({
+            "name": "",
+            "id": "drill_button",
+            "type": "text",
+            "presentation": "markdown"
+        })
+        
+        # Ajoute les colonnes de données
+        for col in data.columns:
+            column_def = {
+                "name": col,
+                "id": col,
+                "type": "text"
+            }
+            
+            # Rend certaines colonnes éditables si spécifié
+            if editable_columns and col in editable_columns:
+                column_def["editable"] = True
+            
+            columns.append(column_def)
+        
+        # Prépare les données avec boutons d'expansion
+        table_data = []
+        for idx, row in data.iterrows():
+            row_dict = row.to_dict()
+            
+            # Ajoute le bouton d'expansion
+            has_drill = drill_data is not None and idx in drill_data
+            row_dict["drill_button"] = "+" if has_drill else ""
+            row_dict["row_id"] = idx  # Stocke l'ID de ligne pour référence
+            
+            table_data.append(row_dict)
+        
+        # Crée le composant tableau principal
+        table = dash_table.DataTable(
+            id=key,
+            data=table_data,
+            columns=columns,
+            row_selectable=False,
+            row_deletable=False,
+            editable=False,
+            filter_action="none",
+            sort_action="native",
+            sort_mode="single",
+            style_table={"overflowX": "auto"},
+            style_cell={
+                "textAlign": "left",
+                "padding": "8px",
+                "fontFamily": "-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif"
+            },
+            style_header={
+                "backgroundColor": "#f8f9fa",
+                "fontWeight": "bold",
+                "borderBottom": "1px solid #e0e0e0"
+            },
+            style_data_conditional=[
+                {
+                    "if": {"row_index": "odd"},
+                    "backgroundColor": "#f8f9fa"
+                },
+                {
+                    "if": {"column_id": "drill_button"},
+                    "cursor": "pointer",
+                    "textAlign": "center",
+                    "fontWeight": "bold",
+                    "color": "#007bff"
+                }
+            ],
+            style_cell_conditional=[
+                {
+                    "if": {"column_id": "drill_button"},
+                    "width": "30px"
+                }
+            ],
+            css=[
+                {"selector": ".dash-cell-value", "rule": "line-height: 15px;"},
+                {"selector": "td.cell--selected, td.focused", "rule": "background-color: rgba(0, 123, 255, 0.1) !important;"},
+                {"selector": "td.cell--selected *, td.focused *", "rule": "color: inherit !important;"}
+            ],
+            cell_selectable=True,
+            page_size=10
+        )
+        
+        # Conteneur pour les détails (initialement vide)
+        detail_container = html.Div(id=f"{key}-detail-container", children=[])
+        
+        # Ajoute les composants au conteneur actuel
+        container = html.Div([
+            table,
+            detail_container,
+            # Store pour suivre l'état d'expansion des lignes
+            dcc.Store(id=f"{key}-expanded-rows", data={})
+        ])
+        
+        self._add_component(container)
+        
+        # Ajoute les callbacks pour gérer l'expansion/réduction
+        if drill_data is not None:
+            # Callback pour gérer les clics sur les cellules
+            @self.app.callback(
+                [Output(f"{key}-detail-container", "children"),
+                 Output(f"{key}-expanded-rows", "data"),
+                 Output(key, "data", allow_duplicate=True)],
+                [Input(key, "active_cell")],
+                [State(key, "data"),
+                 State(f"{key}-expanded-rows", "data")],
+                prevent_initial_call=True
+            )
+            def handle_cell_click(active_cell, data, expanded_rows):
+                if not active_cell:
+                    return dash.no_update, dash.no_update, dash.no_update
+                
+                # Vérifie si le clic est sur la colonne du bouton d'expansion
+                if active_cell["column_id"] != "drill_button":
+                    return dash.no_update, dash.no_update, dash.no_update
+                
+                row_idx = active_cell["row"]
+                row_id = data[row_idx]["row_id"]
+                
+                # Vérifie si cette ligne a des données de détail
+                if row_id not in drill_data:
+                    return dash.no_update, dash.no_update, dash.no_update
+                
+                # Mise à jour de l'état d'expansion
+                expanded_rows = expanded_rows or {}
+                is_expanded = str(row_id) in expanded_rows
+                
+                # Mise à jour des données du tableau
+                updated_data = data.copy()
+                
+                if is_expanded:
+                    # Réduction
+                    updated_data[row_idx]["drill_button"] = "+"
+                    expanded_rows.pop(str(row_id), None)
+                    return [], expanded_rows, updated_data
+                else:
+                    # Expansion
+                    updated_data[row_idx]["drill_button"] = "-"
+                    expanded_rows[str(row_id)] = True
+                    
+                    # Crée le tableau de détails
+                    detail_data = drill_data[row_id]
+                    detail_table = dash_table.DataTable(
+                        id=f"{key}-detail-{row_id}",
+                        data=detail_data.to_dict('records'),
+                        columns=[{"name": col, "id": col} for col in detail_data.columns],
+                        style_table={
+                            "overflowX": "auto",
+                            "marginLeft": "30px",
+                            "marginTop": "5px",
+                            "marginBottom": "15px",
+                            "width": "calc(100% - 30px)"
+                        },
+                        style_cell={
+                            "textAlign": "left",
+                            "padding": "8px",
+                            "fontFamily": "-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif"
+                        },
+                        style_header={
+                            "backgroundColor": "#e9ecef",
+                            "fontWeight": "bold",
+                            "borderBottom": "1px solid #e0e0e0"
+                        },
+                        style_data_conditional=[
+                            {
+                                "if": {"row_index": "odd"},
+                                "backgroundColor": "#f8f9fa"
+                            }
+                        ]
+                    )
+                    
+                    detail_container = html.Div([
+                        html.Div([
+                            html.H6(f"Détails pour {data[row_idx][list(data[row_idx].keys())[1]] if len(data[row_idx]) > 1 else f'ligne {row_idx + 1}'}")
+                        ], style={"marginLeft": "30px", "marginTop": "10px"}),
+                        detail_table
+                    ], style={"borderLeft": "2px solid #007bff", "marginTop": "5px", "marginBottom": "15px"})
+                    
+                    return detail_container, expanded_rows, updated_data
+        
+        return key
+    
     def metric(self, label, value, delta=None, key=None):
         """
         Affiche une métrique
@@ -824,6 +1032,256 @@ class OutilMiseEnPage:
         self._add_component(container)
         
         return container
+    
+    def powerbi_matrix(self, data, group_by=None, metrics=None, key=None):
+        """
+        Affiche une matrice de style PowerBI avec drill-through inline
+        
+        Args:
+            data: Un DataFrame pandas pour les données principales
+            group_by (list): Liste des colonnes pour le groupement (dans l'ordre hiérarchique)
+            metrics (dict): Dictionnaire des métriques à calculer avec leurs agrégations
+                          Ex: {"ventes": "sum", "quantite": "sum", "prix_moyen": "mean"}
+            key (str, optional): Une clé unique pour la matrice
+        
+        Returns:
+            str: ID du tableau pour référence dans les callbacks
+        """
+        from dash import html, dcc, dash_table, Input, Output, State, ALL, MATCH
+        import pandas as pd
+        
+        if key is None:
+            key = f"powerbi-matrix-{str(uuid.uuid4())[:8]}"
+            
+        if group_by is None:
+            group_by = []
+            
+        if metrics is None:
+            metrics = {col: "sum" for col in data.select_dtypes(include=['int64', 'float64']).columns}
+            
+        # Prépare les données agrégées initiales
+        grouped_data = data.groupby(group_by, as_index=False).agg(metrics) if group_by else data
+        
+        # Prépare les colonnes
+        columns = []
+        
+        # Ajoute une colonne pour le niveau d'indentation et le bouton d'expansion
+        columns.append({
+            "name": "",
+            "id": "expand_button",
+            "type": "text",
+            "presentation": "markdown"
+        })
+        
+        # Ajoute les colonnes de groupement
+        for col in group_by:
+            columns.append({
+                "name": col,
+                "id": col,
+                "type": "text"
+            })
+            
+        # Ajoute les colonnes de métriques
+        for metric, _ in metrics.items():
+            columns.append({
+                "name": metric,
+                "id": metric,
+                "type": "numeric",
+                "format": {"specifier": ",.2f"}
+            })
+        
+        def prepare_row_data(df_row, level=0, parent_conditions=None):
+            row_dict = df_row.to_dict()
+            row_dict['expand_button'] = "+" if level < len(group_by) - 1 else ""
+            row_dict['level'] = level
+            # Convertit les conditions parent en chaîne JSON si présentes
+            if parent_conditions:
+                row_dict['parent_conditions'] = json.dumps(parent_conditions)
+            return row_dict
+        
+        # Prépare les données initiales
+        table_data = [prepare_row_data(row, 0) for _, row in grouped_data.iterrows()]
+            
+        # Crée les contrôles de la matrice
+        controls = html.Div([
+            html.Button("Tout développer", id=f"{key}-expand-all", className="btn btn-outline-primary mr-2"),
+            html.Button("Tout réduire", id=f"{key}-collapse-all", className="btn btn-outline-secondary"),
+        ], style={"marginBottom": "10px"})
+            
+        # Crée le composant tableau principal
+        table = dash_table.DataTable(
+            id=key,
+            data=table_data,
+            columns=columns,
+            row_selectable=False,
+            row_deletable=False,
+            editable=False,
+            filter_action="native",
+            sort_action="native",
+            sort_mode="multi",
+            style_table={"overflowX": "auto"},
+            style_cell={
+                "textAlign": "left",
+                "padding": "8px",
+                "fontFamily": "-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif"
+            },
+            style_header={
+                "backgroundColor": "#f8f9fa",
+                "fontWeight": "bold",
+                "borderBottom": "1px solid #e0e0e0"
+            },
+            style_data_conditional=[
+                {
+                    "if": {"row_index": "odd"},
+                    "backgroundColor": "#f8f9fa"
+                },
+                {
+                    "if": {"column_id": "expand_button"},
+                    "cursor": "pointer",
+                    "textAlign": "center",
+                    "fontWeight": "bold",
+                    "color": "#007bff",
+                    "width": "50px"
+                },
+                *[{
+                    "if": {"filter_query": f"{{level}} = {level}"},
+                    "paddingLeft": f"{30 * level + 10}px"
+                } for level in range(len(group_by))]
+            ],
+            css=[
+                {"selector": ".dash-cell-value", "rule": "line-height: 15px;"},
+                {"selector": "td.cell--selected, td.focused", "rule": "background-color: rgba(0, 123, 255, 0.1) !important;"},
+                {"selector": "td.cell--selected *, td.focused *", "rule": "color: inherit !important;"}
+            ],
+            cell_selectable=True,
+            page_size=20
+        )
+        
+        # Ajoute les composants au conteneur actuel
+        container = html.Div([
+            controls,
+            table,
+            # Stores pour l'état
+            dcc.Store(id=f"{key}-expanded-rows", data={}),
+            dcc.Store(id=f"{key}-original-data", data=data.to_dict('records')),
+            dcc.Store(id=f"{key}-group-by", data=group_by),
+            dcc.Store(id=f"{key}-metrics", data=metrics)
+        ])
+        
+        self._add_component(container)
+        
+        # Callback pour gérer l'expansion/réduction des lignes
+        @self.app.callback(
+            Output(key, "data"),
+            [Input(key, "active_cell"),
+             Input(f"{key}-expand-all", "n_clicks"),
+             Input(f"{key}-collapse-all", "n_clicks")],
+            [State(key, "data"),
+             State(f"{key}-original-data", "data"),
+             State(f"{key}-group-by", "data"),
+             State(f"{key}-metrics", "data")],
+            prevent_initial_call=True
+        )
+        def handle_matrix_interaction(active_cell, expand_all, collapse_all, 
+                                   current_data, original_data, group_by, metrics):
+            ctx = callback_context
+            triggered_id = ctx.triggered[0]["prop_id"].split(".")[0]
+            
+            if not ctx.triggered:
+                return dash.no_update
+            
+            df = pd.DataFrame(original_data)
+            
+            if triggered_id == f"{key}-expand-all":
+                # Développe toutes les lignes
+                result_data = []
+                
+                def expand_group(data_subset, level=0, parent_conditions=None):
+                    for _, row in data_subset.iterrows():
+                        row_dict = prepare_row_data(row, level, parent_conditions)
+                        result_data.append(row_dict)
+                        
+                        if level < len(group_by) - 1:
+                            # Prépare les conditions pour le sous-groupe
+                            conditions = {col: row[col] for col in group_by[:level + 1]}
+                            # Filtre et groupe les données pour le niveau suivant
+                            next_data = df
+                            for col, val in conditions.items():
+                                next_data = next_data[next_data[col] == val]
+                            next_grouped = next_data.groupby(group_by[:level + 2]).agg(metrics).reset_index()
+                            expand_group(next_grouped, level + 1, conditions)
+                
+                expand_group(grouped_data)
+                return result_data
+                
+            elif triggered_id == f"{key}-collapse-all":
+                # Retourne aux données initiales
+                return [prepare_row_data(row, 0) for _, row in grouped_data.iterrows()]
+                
+            elif active_cell and active_cell["column_id"] == "expand_button":
+                row_idx = active_cell["row"]
+                current_row = current_data[row_idx]
+                
+                if current_row["expand_button"] == "":
+                    return dash.no_update
+                
+                # Détermine si on développe ou réduit
+                is_expanded = current_row["expand_button"] == "-"
+                
+                if is_expanded:
+                    # Réduit le groupe
+                    level = current_row["level"]
+                    # Supprime toutes les lignes qui appartiennent à ce groupe
+                    result_data = []
+                    skip_until_level = None
+                    
+                    for i, row in enumerate(current_data):
+                        if i < row_idx:
+                            result_data.append(row)
+                        elif i == row_idx:
+                            row = row.copy()
+                            row["expand_button"] = "+"
+                            result_data.append(row)
+                            skip_until_level = row["level"]
+                        else:
+                            if skip_until_level is not None and row["level"] <= skip_until_level:
+                                skip_until_level = None
+                            if skip_until_level is None:
+                                result_data.append(row)
+                    
+                    return result_data
+                else:
+                    # Développe le groupe
+                    level = current_row["level"]
+                    result_data = current_data[:row_idx + 1]
+                    
+                    # Change le bouton d'expansion
+                    result_data[-1] = result_data[-1].copy()
+                    result_data[-1]["expand_button"] = "-"
+                    
+                    # Prépare les conditions pour le filtrage
+                    conditions = {col: current_row[col] for col in group_by[:level + 1]}
+                    
+                    # Filtre et groupe les données pour le niveau suivant
+                    next_data = df
+                    for col, val in conditions.items():
+                        next_data = next_data[next_data[col] == val]
+                    
+                    next_grouped = next_data.groupby(group_by[:level + 2]).agg(metrics).reset_index()
+                    
+                    # Ajoute les lignes développées
+                    for _, row in next_grouped.iterrows():
+                        row_dict = prepare_row_data(row, level + 1, conditions)
+                        result_data.append(row_dict)
+                    
+                    # Ajoute le reste des données
+                    result_data.extend(current_data[row_idx + 1:])
+                    
+                    return result_data
+            
+            return dash.no_update
+        
+        return key
     
     def run(self, debug=True, port=8050, **kwargs):
         """
